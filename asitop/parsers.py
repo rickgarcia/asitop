@@ -75,6 +75,25 @@ def parse_bandwidth_metrics(powermetrics_parse):
     return bandwidth_metrics_dict
 
 
+def _cluster_type(name):
+    """Map a raw powermetrics cluster name to a canonical type.
+
+    Prefix rules (case-insensitive first character):
+      'E' → efficiency cluster
+      'P' → performance cluster
+      'S' → super/spill high-performance cluster (M5+), treated as P for display
+    Falls back to 'P' for any unrecognised prefix so new clusters degrade
+    gracefully rather than crashing.
+    """
+    prefix = name[0].upper()
+    if prefix == 'E':
+        return 'E-Cluster'
+    elif prefix in ('P', 'S'):
+        return 'P-Cluster'
+    else:
+        return 'P-Cluster'
+
+
 def parse_cpu_metrics(powermetrics_parse):
     e_core = []
     p_core = []
@@ -83,51 +102,55 @@ def parse_cpu_metrics(powermetrics_parse):
     # cpu_clusters
     cpu_clusters = cpu_metrics["clusters"]
     for cluster in cpu_clusters:
-        name = cluster["name"]
-        cpu_metric_dict[name+"_freq_Mhz"] = int(cluster["freq_hz"]/(1e6))
-        cpu_metric_dict[name+"_active"] = int((1 - cluster["idle_ratio"])*100)
+        cluster_name = cluster["name"]
+        cluster_type = _cluster_type(cluster_name)
+        cpu_metric_dict[cluster_name + "_freq_Mhz"] = int(cluster["freq_hz"] / (1e6))
+        cpu_metric_dict[cluster_name + "_active"] = int((1 - cluster["idle_ratio"]) * 100)
         for cpu in cluster["cpus"]:
-            name = 'E-Cluster' if name[0] == 'E' else 'P-Cluster'
-            core = e_core if name[0] == 'E' else p_core
+            core = e_core if cluster_type == 'E-Cluster' else p_core
             core.append(cpu["cpu"])
-            cpu_metric_dict[name + str(cpu["cpu"]) + "_freq_Mhz"] = int(cpu["freq_hz"] / (1e6))
-            cpu_metric_dict[name + str(cpu["cpu"]) + "_active"] = int((1 - cpu["idle_ratio"]) * 100)
+            cpu_metric_dict[cluster_type + str(cpu["cpu"]) + "_freq_Mhz"] = int(cpu["freq_hz"] / (1e6))
+            cpu_metric_dict[cluster_type + str(cpu["cpu"]) + "_active"] = int((1 - cpu["idle_ratio"]) * 100)
     cpu_metric_dict["e_core"] = e_core
     cpu_metric_dict["p_core"] = p_core
+
+    # Dynamically aggregate all E-type cluster metrics into the canonical
+    # "E-Cluster" key expected by the rest of the code.  On chips with no
+    # efficiency clusters (e.g. M5) the lowest-frequency P cluster is used
+    # as the E-CPU stand-in so the display still has something meaningful.
     if "E-Cluster_active" not in cpu_metric_dict:
-        # M1 Ultra
-        cpu_metric_dict["E-Cluster_active"] = int(
-            (cpu_metric_dict["E0-Cluster_active"] + cpu_metric_dict["E1-Cluster_active"])/2)
-    if "E-Cluster_freq_Mhz" not in cpu_metric_dict:
-        # M1 Ultra
-        cpu_metric_dict["E-Cluster_freq_Mhz"] = max(
-            cpu_metric_dict["E0-Cluster_freq_Mhz"], cpu_metric_dict["E1-Cluster_freq_Mhz"])
-    if "P-Cluster_active" not in cpu_metric_dict:
-        if "P2-Cluster_active" in cpu_metric_dict:
-            # M1 Ultra
-            cpu_metric_dict["P-Cluster_active"] = int((cpu_metric_dict["P0-Cluster_active"] + cpu_metric_dict["P1-Cluster_active"] +
-                                                      cpu_metric_dict["P2-Cluster_active"] + cpu_metric_dict["P3-Cluster_active"]) / 4)
+        e_names = [c["name"] for c in cpu_clusters if _cluster_type(c["name"]) == 'E-Cluster']
+        if e_names:
+            actives = [cpu_metric_dict[n + "_active"] for n in e_names]
+            freqs   = [cpu_metric_dict[n + "_freq_Mhz"] for n in e_names]
+            cpu_metric_dict["E-Cluster_active"]   = int(sum(actives) / len(actives))
+            cpu_metric_dict["E-Cluster_freq_Mhz"] = max(freqs)
         else:
-            cpu_metric_dict["P-Cluster_active"] = int(
-                (cpu_metric_dict["P0-Cluster_active"] + cpu_metric_dict["P1-Cluster_active"])/2)
-    if "P-Cluster_freq_Mhz" not in cpu_metric_dict:
-        if "P2-Cluster_freq_Mhz" in cpu_metric_dict:
-            # M1 Ultra
-            freqs = [
-                cpu_metric_dict["P0-Cluster_freq_Mhz"],
-                cpu_metric_dict["P1-Cluster_freq_Mhz"],
-                cpu_metric_dict["P2-Cluster_freq_Mhz"],
-                cpu_metric_dict["P3-Cluster_freq_Mhz"]]
+            # No E clusters (e.g. M5): use the lowest-frequency cluster as proxy
+            lowest = min(cpu_clusters, key=lambda c: c["freq_hz"])
+            lname  = lowest["name"]
+            cpu_metric_dict["E-Cluster_active"]   = cpu_metric_dict[lname + "_active"]
+            cpu_metric_dict["E-Cluster_freq_Mhz"] = cpu_metric_dict[lname + "_freq_Mhz"]
+
+    # Dynamically aggregate all P-type (and S-type) cluster metrics into the
+    # canonical "P-Cluster" key.  On M5 this covers P0, P1, and S-Cluster;
+    # on M1 Ultra it covers P0–P3.
+    if "P-Cluster_active" not in cpu_metric_dict:
+        p_names = [c["name"] for c in cpu_clusters if _cluster_type(c["name"]) == 'P-Cluster']
+        if p_names:
+            actives = [cpu_metric_dict[n + "_active"] for n in p_names]
+            freqs   = [cpu_metric_dict[n + "_freq_Mhz"] for n in p_names]
+            cpu_metric_dict["P-Cluster_active"]   = int(sum(actives) / len(actives))
             cpu_metric_dict["P-Cluster_freq_Mhz"] = max(freqs)
         else:
-            cpu_metric_dict["P-Cluster_freq_Mhz"] = max(
-                cpu_metric_dict["P0-Cluster_freq_Mhz"], cpu_metric_dict["P1-Cluster_freq_Mhz"])
+            cpu_metric_dict["P-Cluster_active"]   = 0
+            cpu_metric_dict["P-Cluster_freq_Mhz"] = 0
+
     # power
-    cpu_metric_dict["ane_W"] = cpu_metrics["ane_energy"]/1000
-    #cpu_metric_dict["dram_W"] = cpu_metrics["dram_energy"]/1000
-    cpu_metric_dict["cpu_W"] = cpu_metrics["cpu_energy"]/1000
-    cpu_metric_dict["gpu_W"] = cpu_metrics["gpu_energy"]/1000
-    cpu_metric_dict["package_W"] = cpu_metrics["combined_power"]/1000
+    cpu_metric_dict["ane_W"]     = cpu_metrics["ane_energy"] / 1000
+    cpu_metric_dict["cpu_W"]     = cpu_metrics["cpu_energy"] / 1000
+    cpu_metric_dict["gpu_W"]     = cpu_metrics["gpu_energy"] / 1000
+    cpu_metric_dict["package_W"] = cpu_metrics["combined_power"] / 1000
     return cpu_metric_dict
 
 
