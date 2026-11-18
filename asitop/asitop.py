@@ -14,8 +14,9 @@ parser.add_argument('--avg', type=int, default=30,
                     help='Interval for averaged values (seconds)')
 parser.add_argument('--show_cores', type=bool, default=False,
                     help='Choose show cores mode')
-parser.add_argument('--max_count', type=int, default=0,
-                    help='Max show count to restart powermetrics')
+parser.add_argument('--max_count', type=int, default=1800,
+                    help='Number of display updates after which powermetrics is '
+                         'restarted to rotate its output file (0 = never)')
 args = parser.parse_args()
 
 
@@ -176,6 +177,10 @@ def main():
                 if count >= args.max_count:
                     count = 0
                     powermetrics_process.terminate()
+                    try:
+                        powermetrics_process.wait(timeout=5)
+                    except Exception:
+                        pass
                     timecode = str(int(time.time()))
                     powermetrics_process = run_powermetrics_process(
                         timecode, interval=args.interval * 1000)

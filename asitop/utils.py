@@ -7,32 +7,48 @@ from .parsers import *
 import plistlib
 
 
+# powermetrics appends one plist sample per interval to its output file and
+# the file is never truncated, so only ever read the tail of it. 512KB is
+# comfortably more than two samples.
+TAIL_BYTES = 512 * 1024
+
+
+def read_tail(path, size=TAIL_BYTES):
+    with open(path, 'rb') as fp:
+        fp.seek(0, os.SEEK_END)
+        end = fp.tell()
+        fp.seek(max(0, end - size))
+        return fp.read()
+
+
+def _parse_sample(sample):
+    powermetrics_parse = plistlib.loads(sample)
+    thermal_pressure = parse_thermal_pressure(powermetrics_parse)
+    cpu_metrics_dict = parse_cpu_metrics(powermetrics_parse)
+    gpu_metrics_dict = parse_gpu_metrics(powermetrics_parse)
+    #bandwidth_metrics = parse_bandwidth_metrics(powermetrics_parse)
+    bandwidth_metrics = None
+    timestamp = powermetrics_parse["timestamp"]
+    return cpu_metrics_dict, gpu_metrics_dict, thermal_pressure, bandwidth_metrics, timestamp
+
+
 def parse_powermetrics(path='/tmp/asitop_powermetrics', timecode="0"):
-    data = None
     try:
-        with open(path+timecode, 'rb') as fp:
-            data = fp.read()
-        data = data.split(b'\x00')
-        powermetrics_parse = plistlib.loads(data[-1])
-        thermal_pressure = parse_thermal_pressure(powermetrics_parse)
-        cpu_metrics_dict = parse_cpu_metrics(powermetrics_parse)
-        gpu_metrics_dict = parse_gpu_metrics(powermetrics_parse)
-        #bandwidth_metrics = parse_bandwidth_metrics(powermetrics_parse)
-        bandwidth_metrics = None
-        timestamp = powermetrics_parse["timestamp"]
-        return cpu_metrics_dict, gpu_metrics_dict, thermal_pressure, bandwidth_metrics, timestamp
-    except Exception as e:
-        if data:
-            if len(data) > 1:
-                powermetrics_parse = plistlib.loads(data[-2])
-                thermal_pressure = parse_thermal_pressure(powermetrics_parse)
-                cpu_metrics_dict = parse_cpu_metrics(powermetrics_parse)
-                gpu_metrics_dict = parse_gpu_metrics(powermetrics_parse)
-                #bandwidth_metrics = parse_bandwidth_metrics(powermetrics_parse)
-                bandwidth_metrics = None
-                timestamp = powermetrics_parse["timestamp"]
-                return cpu_metrics_dict, gpu_metrics_dict, thermal_pressure, bandwidth_metrics, timestamp
+        data = read_tail(path+timecode)
+    except OSError:
         return False
+    # samples are NUL-separated; the last chunk may be empty or partially
+    # written, so fall back to the one before it. The first chunk of a tail
+    # read may be truncated, but we never need to reach it.
+    chunks = data.split(b'\x00')
+    for sample in (chunks[-1], chunks[-2] if len(chunks) > 1 else None):
+        if not sample:
+            continue
+        try:
+            return _parse_sample(sample)
+        except Exception:
+            continue
+    return False
 
 
 def clear_console():
